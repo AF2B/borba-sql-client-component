@@ -13,7 +13,8 @@
   (:require [integrant.core :as ig]
             [next.jdbc :as jdbc]
             [next.jdbc.connection :as connection]
-            [next.jdbc.result-set :as rs])
+            [next.jdbc.result-set :as rs]
+            [clojure.string :as str])
   (:import (com.zaxxer.hikari HikariDataSource)))
 
 ;; ── Default result-set builder ───────────────────────────────────────────────
@@ -74,8 +75,8 @@
   (jdbc/execute-one!
    ds
    (into [(str "INSERT INTO " (name table)
-               " (" (clojure.string/join ", " (map name (keys row))) ")"
-               " VALUES (" (clojure.string/join ", " (repeat (count row) "?")) ")"
+               " (" (str/join ", " (map name (keys row))) ")"
+               " VALUES (" (str/join ", " (repeat (count row) "?")) ")"
                " RETURNING *")]
          (vals row))
    default-opts))
@@ -86,8 +87,8 @@
    Example:
      (sql/update! ds :users {:status \"active\"} {:id some-id})"
   [ds table set-map where-map]
-  (let [set-clause   (clojure.string/join ", " (map #(str (name %) " = ?") (keys set-map)))
-        where-clause (clojure.string/join " AND " (map #(str (name %) " = ?") (keys where-map)))
+  (let [set-clause   (str/join ", " (map #(str (name %) " = ?") (keys set-map)))
+        where-clause (str/join " AND " (map #(str (name %) " = ?") (keys where-map)))
         params       (concat (vals set-map) (vals where-map))]
     (jdbc/execute!
      ds
@@ -101,7 +102,7 @@
    Example:
      (sql/delete! ds :users {:id some-id})"
   [ds table where-map]
-  (let [where-clause (clojure.string/join " AND " (map #(str (name %) " = ?") (keys where-map)))
+  (let [where-clause (str/join " AND " (map #(str (name %) " = ?") (keys where-map)))
         params       (vals where-map)]
     (jdbc/execute!
      ds
@@ -116,7 +117,7 @@
    Example:
      (sql/find-by! ds :users {:email \"ana@borba.com\"})"
   [ds table where-map]
-  (let [where-clause (clojure.string/join " AND " (map #(str (name %) " = ?") (keys where-map)))
+  (let [where-clause (str/join " AND " (map #(str (name %) " = ?") (keys where-map)))
         params       (vals where-map)]
     (jdbc/execute!
      ds
@@ -130,7 +131,7 @@
    Example:
      (sql/find-one-by! ds :users {:id some-id})"
   [ds table where-map]
-  (let [where-clause (clojure.string/join " AND " (map #(str (name %) " = ?") (keys where-map)))
+  (let [where-clause (str/join " AND " (map #(str (name %) " = ?") (keys where-map)))
         params       (vals where-map)]
     (jdbc/execute-one!
      ds
