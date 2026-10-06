@@ -1,152 +1,202 @@
 (ns borba.sql-client
-  "Integrant component for PostgreSQL via next.jdbc + HikariCP.
+  "PostgreSQL for a service: a pool of connections as an Integrant component,
+   and the queries that read and write one table.
 
-   Registers :components/database with a pooled DataSource exposed
-   as :sql-client in the component map.
+     :components/database
+     {:jdbc-url #env DATABASE_URL
+      :username #env DATABASE_USER
+      :password #env DATABASE_PASSWORD}
 
-   Wrapper fns provide sensible defaults (kebab-cased result maps,
-   returning one vs. many) so callers don't need to import next.jdbc directly.
+   The value is a HikariCP data source, which every function here takes first.
+   Rows come back as maps with unqualified keywords in kebab-case, so the
+   column created_at is :created-at, and the columns of what is written are
+   written the same way. Values are always parameters; the names of tables and
+   columns are held to what a snake_case name is (see
+   borba.sql-client.statement), so a name cannot be made into SQL.
 
-   Usage:
-     (let [{:keys [sql-client]} components]
-       (sql/execute-one! sql-client [\"SELECT * FROM users WHERE id = ?\" id]))"
-  (:require [integrant.core :as ig]
-            [next.jdbc :as jdbc]
-            [next.jdbc.connection :as connection]
-            [next.jdbc.result-set :as rs]
-            [clojure.string :as str])
-  (:import (com.zaxxer.hikari HikariDataSource)))
+   Times are java.time: an Instant, a LocalDate or a LocalDateTime can be
+   written to a timestamp column, which the PostgreSQL driver does not do by
+   itself, and starting the component makes every timestamp column be read as
+   an Instant. That is process-wide, as next.jdbc makes it, which is why it is
+   the component's start that does it and not the loading of this namespace.
 
-;; ── Default result-set builder ───────────────────────────────────────────────
-;; Converts SQL column names to unqualified kebab-case keywords automatically.
-;; e.g. "created_at" → :created-at, "user_id" → :user-id
+   A failure of the database is an exception, as next.jdbc throws it, and
+   `error-data` turns it into data to match on."
+  (:require
+   [borba.sql-client.errors :as errors]
+   [borba.sql-client.pool :as pool]
+   [borba.sql-client.statement :as statement]
+   [clojure.tools.logging :as log]
+   [integrant.core :as ig]
+   [next.jdbc :as jdbc]
+   [next.jdbc.connection :as connection]
+   [next.jdbc.date-time :as date-time]
+   [next.jdbc.result-set :as rs])
+  (:import
+   (com.zaxxer.hikari HikariDataSource)))
+
+(set! *warn-on-reflection* true)
 
 (def ^:private default-opts
   {:builder-fn rs/as-unqualified-kebab-maps})
 
-;; ── Integrant lifecycle ──────────────────────────────────────────────────────
+(def ^:private ready-timeout-seconds 2)
+
+;; The component
+
+(defn- start-pool
+  "Creates the pool and asks it for a connection, which HikariCP does not do
+   until the first request, so that a database that cannot be reached fails the
+   start and not the first request. Closes what it opened when it fails."
+  [config
+   address]
+  (let [^HikariDataSource datasource (connection/->pool HikariDataSource
+                                                        config)]
+    (try
+      (with-open [_connection (jdbc/get-connection datasource)]
+        datasource)
+      (catch Exception cause
+        (.close datasource)
+        (throw (ex-info (str "the database pool cannot start on " address)
+                        {:error   ::cannot-connect
+                         :address address}
+                        cause))))))
 
 (defmethod ig/init-key :components/database
-  [_ {:keys [jdbc-url username password max-pool-size min-idle]}]
-  (let [ds (connection/->pool
-            HikariDataSource
-            {:jdbcUrl           jdbc-url
-             :username          username
-             :password          password
-             :maximumPoolSize   (or max-pool-size 10)
-             :minimumIdle       (or min-idle 2)
-             :connectionTimeout 30000
-             :idleTimeout       600000
-             :maxLifetime       1800000
-             :poolName          "borba-pool"})]
-    (println "🗄️  [sql-client] Pool started →" jdbc-url)
-    ds))
+  [_ options]
+  (let [config  (pool/pool-config options)
+        address (pool/redact (:jdbcUrl config))
+        _       (date-time/read-as-instant)
+        started (start-pool config address)]
+    (log/infof "database pool %s started on %s (up to %d connections)"
+               (:poolName config)
+               address
+               (:maximumPoolSize config))
+    started))
 
 (defmethod ig/halt-key! :components/database
   [_ datasource]
   (when (instance? HikariDataSource datasource)
     (.close ^HikariDataSource datasource)
-    (println "🗄️  [sql-client] Pool stopped")))
+    (log/infof "database pool %s stopped"
+               (.getPoolName ^HikariDataSource datasource))))
 
-;; ── Public API ───────────────────────────────────────────────────────────────
+;; Queries
 
 (defn execute!
-  "Executes a SQL statement and returns a vector of result rows.
-   SQL must be a vector: [\"SELECT ...\" param1 param2 ...]"
+  "Executes a statement and returns the rows, as a vector of maps.
+   - ds: the data source of the component, or a connection in a transaction
+   - sql: a vector of the SQL text and its parameters
+   - opts: next.jdbc options, merged over the ones that give kebab-case keys
+     (optional)"
   ([ds sql]
-   (jdbc/execute! ds sql default-opts))
-  ([ds sql opts]
+   (execute! ds sql {}))
+  ([ds
+    sql
+    opts]
    (jdbc/execute! ds sql (merge default-opts opts))))
 
 (defn execute-one!
-  "Executes a SQL statement and returns a single row (or nil).
-   SQL must be a vector: [\"SELECT ...\" param1]"
+  "Executes a statement and returns the first row, or nil.
+   - ds: the data source of the component, or a connection in a transaction
+   - sql: a vector of the SQL text and its parameters
+   - opts: next.jdbc options, merged over the ones that give kebab-case keys
+     (optional)"
   ([ds sql]
-   (jdbc/execute-one! ds sql default-opts))
-  ([ds sql opts]
+   (execute-one! ds sql {}))
+  ([ds
+    sql
+    opts]
    (jdbc/execute-one! ds sql (merge default-opts opts))))
 
 (defn insert!
-  "Inserts a row into table and returns the inserted row.
-
-   Example:
-     (sql/insert! ds :users {:id #uuid \"...\" :name \"Ana\" :email \"ana@borba.com\"})"
-  [ds table row]
-  (jdbc/execute-one!
-   ds
-   (into [(str "INSERT INTO " (name table)
-               " (" (str/join ", " (map name (keys row))) ")"
-               " VALUES (" (str/join ", " (repeat (count row) "?")) ")"
-               " RETURNING *")]
-         (vals row))
-   default-opts))
+  "Inserts a row and returns it, as the database stored it.
+   - ds: the data source of the component, or a connection in a transaction
+   - table-name: the table, a keyword such as :users or :audit/events
+   - row: a map from the columns to their values"
+  [ds
+   table-name
+   row]
+  (execute-one! ds (statement/insert-statement table-name row)))
 
 (defn update!
-  "Updates rows matching where-clause and returns updated rows.
-
-   Example:
-     (sql/update! ds :users {:status \"active\"} {:id some-id})"
-  [ds table set-map where-map]
-  (let [set-clause   (str/join ", " (map #(str (name %) " = ?") (keys set-map)))
-        where-clause (str/join " AND " (map #(str (name %) " = ?") (keys where-map)))
-        params       (concat (vals set-map) (vals where-map))]
-    (jdbc/execute!
-     ds
-     (into [(str "UPDATE " (name table) " SET " set-clause " WHERE " where-clause " RETURNING *")]
-           params)
-     default-opts)))
+  "Updates the rows that have the values of a map and returns them.
+   - ds: the data source of the component, or a connection in a transaction
+   - table-name: the table, a keyword such as :users or :audit/events
+   - set-map: a map from the columns to set to their new values
+   - where-map: a map from the columns to the values the rows must have; a nil
+     value is IS NULL, and the map must not be empty"
+  [ds
+   table-name
+   set-map
+   where-map]
+  (execute! ds (statement/update-statement table-name set-map where-map)))
 
 (defn delete!
-  "Deletes rows matching where-clause and returns deleted rows.
-
-   Example:
-     (sql/delete! ds :users {:id some-id})"
-  [ds table where-map]
-  (let [where-clause (str/join " AND " (map #(str (name %) " = ?") (keys where-map)))
-        params       (vals where-map)]
-    (jdbc/execute!
-     ds
-     (into [(str "DELETE FROM " (name table) " WHERE " where-clause " RETURNING *")]
-           params)
-     default-opts)))
+  "Deletes the rows that have the values of a map and returns them.
+   - ds: the data source of the component, or a connection in a transaction
+   - table-name: the table, a keyword such as :users or :audit/events
+   - where-map: a map from the columns to the values the rows must have; a nil
+     value is IS NULL, and the map must not be empty"
+  [ds
+   table-name
+   where-map]
+  (execute! ds (statement/delete-statement table-name where-map)))
 
 (defn find-by!
-  "Finds rows where all conditions in where-map match.
-   Returns a vector of rows.
-
-   Example:
-     (sql/find-by! ds :users {:email \"ana@borba.com\"})"
-  [ds table where-map]
-  (let [where-clause (str/join " AND " (map #(str (name %) " = ?") (keys where-map)))
-        params       (vals where-map)]
-    (jdbc/execute!
-     ds
-     (into [(str "SELECT * FROM " (name table) " WHERE " where-clause)]
-           params)
-     default-opts)))
+  "Returns the rows that have the values of a map, as a vector.
+   - ds: the data source of the component, or a connection in a transaction
+   - table-name: the table, a keyword such as :users or :audit/events
+   - where-map: a map from the columns to the values the rows must have; a nil
+     value is IS NULL, and the map must not be empty"
+  [ds
+   table-name
+   where-map]
+  (execute! ds (statement/select-statement table-name where-map)))
 
 (defn find-one-by!
-  "Like find-by! but returns a single row (or nil).
+  "Returns the first row that has the values of a map, or nil.
+   - ds: the data source of the component, or a connection in a transaction
+   - table-name: the table, a keyword such as :users or :audit/events
+   - where-map: a map from the columns to the values the rows must have; a nil
+     value is IS NULL, and the map must not be empty"
+  [ds
+   table-name
+   where-map]
+  (execute-one! ds (statement/select-statement table-name where-map)))
 
-   Example:
-     (sql/find-one-by! ds :users {:id some-id})"
-  [ds table where-map]
-  (let [where-clause (str/join " AND " (map #(str (name %) " = ?") (keys where-map)))
-        params       (vals where-map)]
-    (jdbc/execute-one!
-     ds
-     (into [(str "SELECT * FROM " (name table) " WHERE " where-clause)]
-           params)
-     default-opts)))
+;; Transactions
 
-(defmacro with-transaction
-  "Executes body within a database transaction.
-   Rolls back on any exception.
+(defn transact!
+  "Calls a function with a connection in a transaction, and commits when it
+   returns. The transaction is rolled back, and the exception thrown again,
+   when the function throws.
+   - ds: the data source of the component
+   - f: a function of the connection, which takes the place of the data source
+     in the functions of this namespace"
+  [ds f]
+  (jdbc/transact ds f))
 
-   Example:
-     (sql/with-transaction [tx ds]
-       (sql/insert! tx :users row)
-       (sql/insert! tx :audit {:user-id (:id row)}))"
-  [[binding ds] & body]
-  `(jdbc/with-transaction [~binding ~ds]
-     ~@body))
+;; Health and failures
+
+(defn ready?
+  "Returns true when the database answers a query within two seconds, and false
+   when it does not or when there is no connection to ask it with. It never
+   throws, so a readiness check can call it.
+   - ds: the data source of the component"
+  [ds]
+  (try
+    (= 1 (:one (execute-one! ds
+                             ["SELECT 1 AS one"]
+                             {:timeout ready-timeout-seconds})))
+    (catch Exception _
+      false)))
+
+(defn error-data
+  "Returns the failure of a database exception as data, with an :error keyword
+   such as :unique-violation and the names of the constraint and the table, or
+   nil when the exception is not from the database. See
+   borba.sql-client.errors.
+   - e: the exception"
+  [e]
+  (errors/error-data e))
